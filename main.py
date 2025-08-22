@@ -2,7 +2,7 @@
 
 print("✅ Python funktioniert!")
 
-for i in range(1, 25):
+for i in range(1, 20):
     print(f"Zahl {i}")
 
 print()
