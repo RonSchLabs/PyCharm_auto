@@ -2,12 +2,11 @@
 
 print("✅ Python funktioniert!")
 
-for i in range(1, 21):
+for i in range(1, 15):
     print(f"Zahl {i}")
 
 print()
 print("Ich bin Fertig")
 
 name = input("Bitte gib deinen Namen ein: ")
-print(f"{name} 😊")
 print(f"{name} 😊")
