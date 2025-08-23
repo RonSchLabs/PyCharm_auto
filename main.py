@@ -10,4 +10,3 @@ print("Ich bin Fertig")
 
 name = input("Bitte gib deinen Namen ein: ")
 print(f"{name} 😊")
-print(f"{name} 😊")
