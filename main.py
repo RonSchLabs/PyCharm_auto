@@ -3,14 +3,15 @@
 
 """
 Live-Anonymisierung (Pixelation) für RTSP-Kameras mit Netzwerk-Streaming.
-- Liest RTSP-Stream einer IP-Kamera ein
-- Erkennt Gesichter und Personen und verpixelt diese live
+- Liest RTSP-Stream einer IP-Kamera ein (RTSP über TCP)
+- Erkennt Personen robust mit YOLOv8 (ultralytics) und verpixelt diese vollständig
+- Tracking (CSRT) hält Verpixelung stabil, auch wenn Erkennung kurz aussetzt
 - Stellt den anonymisierten Stream als MJPEG über HTTP im Netzwerk bereit
 - Kleine HTML-Seite zeigt den Stream im Browser an
-- Zusätzlich Anzeige im lokalen Fenster optional möglich
+- Optional zusätzlich Anzeige im lokalen Fenster
 
 Abhängigkeiten:
-    pip install opencv-python numpy flask
+    pip install ultralytics opencv-python numpy flask
 
 Startbeispiel:
     python live_anonymizer_stream.py --host 0.0.0.0 --port 8000
@@ -25,28 +26,46 @@ import time
 import threading
 from typing import Tuple, List, Optional
 import os
+import math
+
+# RTSP über TCP für OpenCV/FFmpeg erzwingen (muss vor dem ersten OpenCV-Call gesetzt sein)
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
 import cv2
 import numpy as np
 from flask import Flask, Response, render_template_string
+
+# YOLOv8 (ultralytics)
+from ultralytics import YOLO
 
 
 # =========================
 # Konfiguration (anpassen)
 # =========================
 
-# Deine RTSP-URL (vom User geliefert)
+# Deine RTSP-URL
 DEFAULT_RTSP_URL = "rtsp://Io48S87WqWjPuaSh:Nx9UVb2ozhy0dtsH@192.168.178.73/live0"
 
 # Skalierung für Performance (1.0 = original; 0.75 oder 0.5 spart CPU)
 FRAME_DOWNSCALE = 0.75
 
 # Pixelations-Parameter
-PIXEL_BLOCKS_FACE = 12
-PIXEL_BLOCKS_PERSON = 20
+PIXEL_BLOCKS_PERSON = 22      # höher = gröberes Mosaik
+BBOX_SCALE_PERSON = 1.20      # Box etwas größer, damit nichts „durchrutscht“
 
-# Gesichts-Erkennung
-FACE_MIN_SIZE = (40, 40)  # Mindestgröße (Breite, Höhe) nach Downscale
+# YOLO-Einstellungen
+YOLO_MODEL_NAME = "yolov8n.pt"  # leicht und schnell; alternativ "yolov8s.pt"
+YOLO_CONFIDENCE = 0.35          # Konfidenzschwelle
+YOLO_IOU_NMS = 0.45             # NMS IoU-Schwelle
+YOLO_CLASSES = [0]              # nur "person"
+DETECT_EVERY = 2                # alle N Frames neu detektieren (dazwischen nur tracken)
+MIN_BOX_AREA = 28 * 28          # sehr kleine Boxen filtern (nach Downscale gemessen)
+
+# Tracking
+TRACKER_TYPE = "CSRT"           # "CSRT" (genauer) oder "KCF" (schneller)
+TRACK_TTL = 10                  # wie viele Frames darf ein Track ohne frische Erkennung leben
+MAX_TRACKS = 32                 # Schutz vor Tracker-Explosion
+IOU_MATCH_THRESH = 0.3          # Zuordnung Detection↔Track
 
 # Debug-Rahmen zeichnen
 DRAW_DEBUG_BOXES = False
@@ -57,10 +76,10 @@ MAX_RECONNECT_TRIES = 0  # 0 = unendlich probieren
 
 # Anzeige im lokalen Fenster (True → zusätzlich cv2.imshow)
 SHOW_LOCAL_WINDOW = False
-WINDOW_TITLE = "Live-Personen-Anonymisierung (anonymisierter Stream)"
+WINDOW_TITLE = "Live-Personen-Anonymisierung (YOLOv8 + Tracking)"
 
 # JPEG-Qualität für den MJPEG-Stream (100 = beste Qualität, größte Dateien)
-JPEG_QUALITY = 50  # bei Bedarf 60–70 testen
+JPEG_QUALITY = 55  # 50–70 ist meist ein guter Bereich
 
 
 # =========================
@@ -68,9 +87,7 @@ JPEG_QUALITY = 50  # bei Bedarf 60–70 testen
 # =========================
 
 def pixelate_region(img: np.ndarray, blocks: int) -> np.ndarray:
-    """
-    Verpixelt eine Bildregion (Mosaik). 'blocks' steuert die Grobheit.
-    """
+    """Verpixelt eine Bildregion (Mosaik). 'blocks' steuert die Grobheit."""
     h, w = img.shape[:2]
     if h == 0 or w == 0:
         return img
@@ -79,9 +96,7 @@ def pixelate_region(img: np.ndarray, blocks: int) -> np.ndarray:
 
 
 def expand_bbox(x: int, y: int, w: int, h: int, scale: float, bounds: Tuple[int, int]) -> Tuple[int, int, int, int]:
-    """
-    Vergrößert eine Box gleichmäßig und clamped sie an die Bildgrenzen.
-    """
+    """Vergrößert eine Box gleichmäßig und clamped sie an die Bildgrenzen."""
     cx = x + w / 2
     cy = y + h / 2
     nw = int(w * scale)
@@ -95,103 +110,197 @@ def expand_bbox(x: int, y: int, w: int, h: int, scale: float, bounds: Tuple[int,
     return nx, ny, max(0, nx2 - nx), max(0, ny2 - ny)
 
 
-def draw_box(frame: np.ndarray, x: int, y: int, w: int, h: int, color=(0, 255, 0), label: str = "") -> None:
-    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+def draw_box(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, color=(0, 255, 0), label: str = "") -> None:
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     if label:
-        cv2.putText(frame, label, (x, max(0, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        cv2.putText(frame, label, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
 
-def non_max_suppression(boxes: np.ndarray, overlapThresh: float = 0.65) -> List[Tuple[int, int, int, int]]:
-    """
-    Einfache NMS für Boxen im Format [x1, y1, x2, y2].
-    """
-    if len(boxes) == 0:
-        return []
-    boxes = boxes.astype("float")
-    pick = []
-
-    x1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x2 = boxes[:, 2]
-    y2 = boxes[:, 3]
-
-    area = (x2 - x1 + 1) * (y2 - y1 + 1)
-    idxs = np.argsort(y2)
-
-    while len(idxs) > 0:
-        i = idxs[-1]
-        pick.append(i)
-        suppress = [len(idxs) - 1]
-
-        for pos in range(0, len(idxs) - 1):
-            j = idxs[pos]
-            xx1 = max(x1[i], x1[j])
-            yy1 = max(y1[i], y1[j])
-            xx2 = min(x2[i], x2[j])
-            yy2 = min(y2[i], y2[j])
-
-            w = max(0, xx2 - xx1 + 1)
-            h = max(0, yy2 - yy1 + 1)
-
-            overlap = float(w * h) / area[j]
-            if overlap > overlapThresh:
-                suppress.append(pos)
-
-        idxs = np.delete(idxs, suppress)
-
-    picked = boxes[pick].astype("int")
-    return [(int(a), int(b), int(c), int(d)) for (a, b, c, d) in picked]
+def iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
+    """IoU zweier Boxen im Format [x1,y1,x2,y2]."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    iw = max(0, inter_x2 - inter_x1)
+    ih = max(0, inter_y2 - inter_y1)
+    inter = iw * ih
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return (inter / union) if union > 0 else 0.0
 
 
-# =========================
-# Detector-Setup
-# =========================
-
-def create_face_detector():
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    face_cascade = cv2.CascadeClassifier(cascade_path)
-    if face_cascade.empty():
-        raise RuntimeError(f"Gesichts-Cascade nicht gefunden: {cascade_path}")
-    return face_cascade
-
-
-def create_person_detector():
-    hog = cv2.HOGDescriptor()
-    hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-    return hog
+def create_opencv_tracker():
+    """Erzeugt einen OpenCV-Tracker (CSRT bevorzugt, sonst KCF)."""
+    tracker = None
+    if TRACKER_TYPE.upper() == "CSRT":
+        create_names = ["legacy.TrackerCSRT_create", "TrackerCSRT_create"]
+    else:
+        create_names = ["legacy.TrackerKCF_create", "TrackerKCF_create"]
+    for name in create_names:
+        parts = name.split(".")
+        obj = cv2
+        try:
+            for p in parts:
+                obj = getattr(obj, p)
+            tracker = obj()
+            break
+        except Exception:
+            continue
+    if tracker is None:
+        # Fallback auf MIL (breit verfügbar)
+        create_names = ["legacy.TrackerMIL_create", "TrackerMIL_create"]
+        for name in create_names:
+            parts = name.split(".")
+            obj = cv2
+            try:
+                for p in parts:
+                    obj = getattr(obj, p)
+                tracker = obj()
+                break
+            except Exception:
+                continue
+    if tracker is None:
+        raise RuntimeError("Kein geeigneter OpenCV-Tracker verfügbar (CSRT/KCF/MIL nicht gefunden).")
+    return tracker
 
 
 # =========================
-# RTSP → Anonymisierte Frames
+# Tracking-Manager
+# =========================
+
+class Track:
+    def __init__(self, box_xyxy: Tuple[int, int, int, int], frame: np.ndarray):
+        self.tracker = create_opencv_tracker()
+        x1, y1, x2, y2 = box_xyxy
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        self.tracker.init(frame, (x1, y1, w, h))
+        self.missed = 0  # wie viele Frames ohne frische Erkennung
+
+    def update(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        ok, box = self.tracker.update(frame)
+        if not ok or box is None:
+            self.missed += 1
+            return None
+        x, y, w, h = box
+        x1 = int(x)
+        y1 = int(y)
+        x2 = int(x + w)
+        y2 = int(y + h)
+        return (x1, y1, x2, y2)
+
+
+class TrackManager:
+    def __init__(self):
+        self.tracks: List[Track] = []
+
+    def update_with_detections(self, frame: np.ndarray, dets_xyxy: List[Tuple[int, int, int, int]]) -> None:
+        """Detections den bestehenden Tracks zuordnen (IoU) und ggf. neue Tracks anlegen."""
+        # Bestehende BBoxen holen
+        current_boxes = []
+        for t in self.tracks:
+            bb = t.update(frame)
+            current_boxes.append(bb)
+
+        # IoU-Zuordnung: jede Detection einem besten Track zuweisen (wenn IoU >= Schwelle)
+        used_tracks = set()
+        used_dets = set()
+        for di, det in enumerate(dets_xyxy):
+            best_iou, best_ti = 0.0, -1
+            for ti, bb in enumerate(current_boxes):
+                if bb is None or ti in used_tracks:
+                    continue
+                iou = iou_xyxy(np.array(det), np.array(bb))
+                if iou > best_iou:
+                    best_iou, best_ti = iou, ti
+            if best_iou >= IOU_MATCH_THRESH and best_ti >= 0:
+                # Track mit Detection „re-initen“, damit er sauber sitzt
+                self.tracks[best_ti] = Track(det, frame)
+                used_tracks.add(best_ti)
+                used_dets.add(di)
+
+        # Für nicht zugeordnete Detections neue Tracks erzeugen
+        for di, det in enumerate(dets_xyxy):
+            if di in used_dets:
+                continue
+            if len(self.tracks) >= MAX_TRACKS:
+                break
+            self.tracks.append(Track(det, frame))
+
+        # Nicht gematchte Tracks „altern“ lassen
+        for ti, t in enumerate(self.tracks):
+            if ti in used_tracks:
+                t.missed = 0
+            else:
+                t.missed += 1
+
+        # Abgelaufene Tracks entfernen
+        self.tracks = [t for t in self.tracks if t.missed <= TRACK_TTL]
+
+    def update_only(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """Nur Tracks updaten (kein neuerkennungslauf) und BBoxen zurückgeben."""
+        boxes = []
+        for t in self.tracks:
+            bb = t.update(frame)
+            if bb is not None:
+                boxes.append(bb)
+        # Abgelaufene Tracks entfernen
+        self.tracks = [t for t in self.tracks if t.missed <= TRACK_TTL]
+        return boxes
+
+    def boxes(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """Aktuelle Track-BBoxen (nach Update) liefern."""
+        out = []
+        for t in self.tracks:
+            bb = t.update(frame)
+            if bb is not None:
+                out.append(bb)
+        return out
+
+
+# =========================
+# RTSP → Anonymisierte Frames (YOLO + Tracking)
 # =========================
 
 class AnonymizerWorker(threading.Thread):
     """
-    Hintergrund-Thread: Liest RTSP, anonymisiert Frames und stellt das letzte verarbeitete Frame bereit.
+    Hintergrund-Thread:
+    - Liest RTSP (über TCP) mit OpenCV/FFmpeg
+    - YOLOv8-Detektion (Personen), skaliert und auf Originalreihenfolge zurückgerechnet
+    - Tracking (CSRT) hält Boxen stabil
+    - Verpixelung auf Originalframe
+    - Stellt das letzte verarbeitete Frame bereit
     """
 
     def __init__(self, rtsp_url: str):
         super().__init__(daemon=True)
         self.rtsp_url = rtsp_url
-        self.face_cascade = create_face_detector()
-        self.hog = create_person_detector()
         self.last_frame: Optional[np.ndarray] = None
         self.lock = threading.Lock()
         self._stop = threading.Event()
+
+        # YOLO-Modell laden (wird beim ersten Mal automatisch heruntergeladen)
+        self.yolo = YOLO(YOLO_MODEL_NAME)
+
+        # Tracking-Manager
+        self.tracks = TrackManager()
 
     def stop(self):
         self._stop.set()
 
     def run(self):
         reconnect_tries = 0
-        while not self._stop.is_set():
-            # Schritt 2b: RTSP-Transport auf TCP erzwingen (stabiler als UDP)
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+        frame_idx = 0
 
-            # Schritt 2a: Backend FFMPEG verwenden + kleinen Capture-Puffer setzen
+        while not self._stop.is_set():
+            # OpenCV/FFmpeg-Backend mit TCP (OPENCV_FFMPEG_CAPTURE_OPTIONS oben gesetzt)
             cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
             try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # kleinen Puffer versuchen
             except Exception:
                 pass
 
@@ -204,11 +313,8 @@ class AnonymizerWorker(threading.Thread):
                 continue
 
             reconnect_tries = 0
-            while not self._stop.is_set():
-                # Optionaler Buffer-Drain (Schritt 2c) – standardmäßig auskommentiert
-                # for _ in range(2):
-                #     cap.grab()
 
+            while not self._stop.is_set():
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     cap.release()
@@ -217,64 +323,79 @@ class AnonymizerWorker(threading.Thread):
 
                 orig_h, orig_w = frame.shape[:2]
 
-                # Downscale für Performance
+                # Downscale für Erkennung/Tracking (Performance)
                 if FRAME_DOWNSCALE != 1.0:
-                    frame_small = cv2.resize(
-                        frame,
-                        (int(orig_w * FRAME_DOWNSCALE), int(orig_h * FRAME_DOWNSCALE)),
-                        interpolation=cv2.INTER_AREA
-                    )
+                    small_w = int(orig_w * FRAME_DOWNSCALE)
+                    small_h = int(orig_h * FRAME_DOWNSCALE)
+                    frame_small = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
                 else:
                     frame_small = frame
+                    small_h, small_w = orig_h, orig_w
 
-                small_h, small_w = frame_small.shape[:2]
-
-                # Gesichter
-                gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
-                faces = self.face_cascade.detectMultiScale(
-                    gray,
-                    scaleFactor=1.1,
-                    minNeighbors=5,
-                    minSize=FACE_MIN_SIZE
-                )
-
-                # Personen
-                rects, weights = self.hog.detectMultiScale(
-                    frame_small,
-                    winStride=(8, 8),
-                    padding=(8, 8),
-                    scale=1.05
-                )
-                rects_np = np.array([[x, y, x + w, y + h] for (x, y, w, h) in rects])
-                picks = non_max_suppression(rects_np, overlapThresh=0.65)
-
-                # Pixelation anwenden (auf Originalgröße zurückrechnen)
                 out_frame = frame.copy()
                 scale_back = (1.0 / FRAME_DOWNSCALE) if FRAME_DOWNSCALE != 0 else 1.0
 
-                for (x, y, w, h) in faces:
-                    x, y, w, h = expand_bbox(x, y, w, h, scale=1.15, bounds=(small_w, small_h))
-                    X = int(x * scale_back)
-                    Y = int(y * scale_back)
-                    W = int(w * scale_back)
-                    H = int(h * scale_back)
-                    roi = out_frame[Y:Y + H, X:X + W]
-                    out_frame[Y:Y + H, X:X + W] = pixelate_region(roi, blocks=PIXEL_BLOCKS_FACE)
-                    if DRAW_DEBUG_BOXES:
-                        draw_box(out_frame, X, Y, W, H, (0, 255, 255), "Face")
+                det_boxes_small: List[Tuple[int, int, int, int]] = []
 
-                for (x1, y1, x2, y2) in picks:
+                # Alle N Frames: YOLO-Detektion (Personen)
+                if frame_idx % DETECT_EVERY == 0:
+                    # YOLO erwartet RGB; OpenCV liefert BGR
+                    rgb_small = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
+                    results = self.yolo.predict(
+                        source=rgb_small,
+                        classes=YOLO_CLASSES,
+                        conf=YOLO_CONFIDENCE,
+                        iou=YOLO_IOU_NMS,
+                        verbose=False
+                    )
+                    dets = []
+                    if results and len(results) > 0:
+                        r0 = results[0]
+                        if r0.boxes is not None and r0.boxes.xyxy is not None:
+                            xyxy = r0.boxes.xyxy.cpu().numpy() if hasattr(r0.boxes.xyxy, "cpu") else np.array(r0.boxes.xyxy)
+                            confs = r0.boxes.conf.cpu().numpy() if hasattr(r0.boxes.conf, "cpu") else np.array(r0.boxes.conf)
+                            for (x1, y1, x2, y2), c in zip(xyxy, confs):
+                                w = max(0.0, x2 - x1)
+                                h = max(0.0, y2 - y1)
+                                if (w * h) < MIN_BOX_AREA:
+                                    continue
+                                dets.append((int(x1), int(y1), int(x2), int(y2)))
+                    det_boxes_small = dets
+
+                    # Tracking-Manager mit neuen Detections auf Originalgröße aktualisieren
+                    det_boxes_orig = []
+                    for (sx1, sy1, sx2, sy2) in det_boxes_small:
+                        # Box leicht vergrößern
+                        ex, ey, ew, eh = expand_bbox(sx1, sy1, sx2 - sx1, sy2 - sy1, BBOX_SCALE_PERSON, (small_w, small_h))
+                        ox1 = int(ex * scale_back)
+                        oy1 = int(ey * scale_back)
+                        ox2 = int((ex + ew) * scale_back)
+                        oy2 = int((ey + eh) * scale_back)
+                        # Clampen
+                        ox1 = max(0, min(orig_w - 1, ox1))
+                        oy1 = max(0, min(orig_h - 1, oy1))
+                        ox2 = max(0, min(orig_w, ox2))
+                        oy2 = max(0, min(orig_h, oy2))
+                        if ox2 > ox1 and oy2 > oy1:
+                            det_boxes_orig.append((ox1, oy1, ox2, oy2))
+
+                    self.tracks.update_with_detections(out_frame, det_boxes_orig)
+
+                else:
+                    # Nur vorhandene Tracks fortschreiben
+                    self.tracks.update_only(out_frame)
+
+                # Alle Track-Boxen holen und verpixeln
+                for (x1, y1, x2, y2) in self.tracks.boxes(out_frame):
+                    # Sicherheitshalber nochmals Box minimal vergrößern
                     w = x2 - x1
                     h = y2 - y1
-                    x, y, w, h = expand_bbox(x1, y1, w, h, scale=1.05, bounds=(small_w, small_h))
-                    X = int(x * scale_back)
-                    Y = int(y * scale_back)
-                    W = int(w * scale_back)
-                    H = int(h * scale_back)
-                    roi = out_frame[Y:Y + H, X:X + W]
-                    out_frame[Y:Y + H, X:X + W] = pixelate_region(roi, blocks=PIXEL_BLOCKS_PERSON)
+                    ex, ey, ew, eh = expand_bbox(x1, y1, w, h, 1.02, (orig_w, orig_h))
+                    X1, Y1, X2, Y2 = ex, ey, ex + ew, ey + eh
+                    roi = out_frame[Y1:Y2, X1:X2]
+                    out_frame[Y1:Y2, X1:X2] = pixelate_region(roi, blocks=PIXEL_BLOCKS_PERSON)
                     if DRAW_DEBUG_BOXES:
-                        draw_box(out_frame, X, Y, W, H, (255, 0, 0), "Person")
+                        draw_box(out_frame, X1, Y1, X2, Y2, (0, 255, 0), "person")
 
                 # Letztes Frame aktualisieren
                 with self.lock:
@@ -287,8 +408,9 @@ class AnonymizerWorker(threading.Thread):
                         self.stop()
                         break
 
-            # innere while (Reconnect) endet, erneuter Verbindungsversuch folgt
+                frame_idx += 1
 
+            # Reconnect
         if SHOW_LOCAL_WINDOW:
             cv2.destroyAllWindows()
 
@@ -336,10 +458,8 @@ def create_app(worker: AnonymizerWorker) -> Flask:
                 with worker.lock:
                     frame = None if worker.last_frame is None else worker.last_frame.copy()
                 if frame is None:
-                    # Noch kein Frame – kurz warten
-                    time.sleep(0.05)
+                    time.sleep(0.02)
                     continue
-                # JPEG kodieren
                 ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
                 if not ok:
                     continue
@@ -350,7 +470,6 @@ def create_app(worker: AnonymizerWorker) -> Flask:
                     b"Content-Length: " + str(len(jpg_bytes)).encode() + b"\r\n\r\n" +
                     jpg_bytes + b"\r\n"
                 )
-
         return Response(mjpeg_generator(),
                         mimetype="multipart/x-mixed-replace; boundary=frame")
 
@@ -362,7 +481,7 @@ def create_app(worker: AnonymizerWorker) -> Flask:
 # =========================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="RTSP → anonymisierter MJPEG-Stream über HTTP.")
+    parser = argparse.ArgumentParser(description="RTSP → anonymisierter MJPEG-Stream über HTTP (YOLOv8 + Tracking).")
     parser.add_argument("--rtsp", type=str, default=DEFAULT_RTSP_URL, help="RTSP-URL der Kamera")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Bind-Adresse des HTTP-Servers")
     parser.add_argument("--port", type=int, default=8000, help="Port des HTTP-Servers")
