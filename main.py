@@ -60,7 +60,7 @@ SHOW_LOCAL_WINDOW = False
 WINDOW_TITLE = "Live-Personen-Anonymisierung (anonymisierter Stream)"
 
 # JPEG-Qualität für den MJPEG-Stream (100 = beste Qualität, größte Dateien)
-JPEG_QUALITY = 50  # starte mit 60; später ggf. auf 50 oder 70 feinjustieren
+JPEG_QUALITY = 50  # bei Bedarf 60–70 testen
 
 
 # =========================
@@ -185,14 +185,16 @@ class AnonymizerWorker(threading.Thread):
     def run(self):
         reconnect_tries = 0
         while not self._stop.is_set():
-          # Backend: FFMPEG verwenden (robuster bei RTSP)
-          cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+            # Schritt 2b: RTSP-Transport auf TCP erzwingen (stabiler als UDP)
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
-          # Kleinen Capture-Puffer erzwingen (verhindert „alten“ Frame-Stau)
-          try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-          except Exception:
-            pass
+            # Schritt 2a: Backend FFMPEG verwenden + kleinen Capture-Puffer setzen
+            cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+
             if not cap.isOpened():
                 reconnect_tries += 1
                 if MAX_RECONNECT_TRIES and reconnect_tries > MAX_RECONNECT_TRIES:
@@ -203,6 +205,10 @@ class AnonymizerWorker(threading.Thread):
 
             reconnect_tries = 0
             while not self._stop.is_set():
+                # Optionaler Buffer-Drain (Schritt 2c) – standardmäßig auskommentiert
+                # for _ in range(2):
+                #     cap.grab()
+
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     cap.release()
