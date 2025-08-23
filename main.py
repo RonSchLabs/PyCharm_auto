@@ -185,7 +185,14 @@ class AnonymizerWorker(threading.Thread):
     def run(self):
         reconnect_tries = 0
         while not self._stop.is_set():
-            cap = cv2.VideoCapture(self.rtsp_url)
+          # Backend: FFMPEG verwenden (robuster bei RTSP)
+          cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+
+          # Kleinen Capture-Puffer erzwingen (verhindert „alten“ Frame-Stau)
+          try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+          except Exception:
+            pass
             if not cap.isOpened():
                 reconnect_tries += 1
                 if MAX_RECONNECT_TRIES and reconnect_tries > MAX_RECONNECT_TRIES:
