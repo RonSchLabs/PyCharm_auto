@@ -58,6 +58,9 @@ MAX_RECONNECT_TRIES = 0  # 0 = unendlich probieren
 SHOW_LOCAL_WINDOW = False
 WINDOW_TITLE = "Live-Personen-Anonymisierung (anonymisierter Stream)"
 
+# JPEG-Qualität für den MJPEG-Stream (100 = beste Qualität, größte Dateien)
+JPEG_QUALITY = 50  # starte mit 60; später ggf. auf 50 oder 70 feinjustieren
+
 
 # =========================
 # Hilfsfunktionen
@@ -323,7 +326,7 @@ def create_app(worker: AnonymizerWorker) -> Flask:
                     time.sleep(0.05)
                     continue
                 # JPEG kodieren
-                ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
                 if not ok:
                     continue
                 jpg_bytes = buffer.tobytes()
