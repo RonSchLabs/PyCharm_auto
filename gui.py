@@ -19,7 +19,7 @@ COPYRIGHT_TEXT = "Shopfloor IT Gießerei und Bearbeitung | COK-Z/5 | Ronny Schmi
 class PfadAnalyseApp(tk.Frame):
     def __init__(self, master):
         super().__init__(master)
-        self.master.title("Pfadanalyse v2 – Ordneranalyse (Windows)")
+        self.master.title("Pfadanalyse v2 – Ordneranalyse")
         self.master.geometry("1600x980")
         self.pack(fill="both", expand=True)
 
