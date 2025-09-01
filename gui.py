@@ -472,12 +472,18 @@ class PfadAnalyseApp(tk.Frame):
       """Canvas an neue Größe anpassen und linken Rand optimal setzen."""
       try:
         widget = self.canvas.get_tk_widget()
+        # Eltern-Container aktualisieren, damit die neue Größe sicher bekannt ist
+        try:
+          self.right.update_idletasks()
+        except Exception:
+          pass
         widget.update_idletasks()
-        w = max(1, widget.winfo_width())
-        h = max(1, widget.winfo_height())
+        w = max(1, self.right.winfo_width())
+        h = max(1, self.right.winfo_height())
+        widget.configure(width=w, height=h)
         self.figure.set_size_inches(w / self.figure.dpi, h / self.figure.dpi)
         self._set_compact_left_margin()
-        self.figure.canvas.draw_idle()
+        self.canvas.draw_idle()
       except Exception:
         pass
 
@@ -532,9 +538,6 @@ class PfadAnalyseApp(tk.Frame):
         self.ax_count.set_xlim(0, right_c)
         right_s = (max_size_scaled * 1.1) if max_size_scaled > 0 else 1.0
         self.ax_size.set_xlim(0, right_s)
-
-        auto_x = max(6, 12 - 0.06 * len(labels))
-        auto_y = max(4, 12 - 0.08 * len(labels) + self.font_adjust.get())
 
         auto_x = max(6, 12 - 0.06 * len(labels))
         auto_y = max(4, 12 - 0.08 * len(labels) + self.font_adjust.get())
