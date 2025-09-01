@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Schneller rekursiver Scanner für Windows.
+Schneller rekursiver Scanner für Windows und macOS.
 - Versteckte/System-Ordner werden übersprungen
 - Symlinks/Junctions werden nicht verfolgt (follow_symlinks=False)
 - Optional: mehrere Worker (Standard 1 – oft schneller/konstanter auf HDDs)
