@@ -34,7 +34,8 @@ class PfadAnalyseApp(tk.Frame):
         self._current_path = tk.StringVar(value="")
         self.top_n_enabled = tk.BooleanVar(value=False)  # standardmäßig aus
         self.top_n = tk.IntVar(value=15)
-        self.sort_mode = tk.StringVar(value="size")      # "size" oder "count"
+        self.sort_mode = tk.StringVar(value="size")  # "size" oder "count"
+        self.font_adjust = tk.IntVar(value=0)
         self.font_adjust = tk.IntVar(value=0)
         # --- Shutdown/Timer-State ---
         self._closing = False
@@ -118,6 +119,10 @@ class PfadAnalyseApp(tk.Frame):
 
         self.btn_toggle_tree = ttk.Button(bar, text="Baum ausblenden", command=self._toggle_tree)
         self.btn_toggle_tree.pack(side="left", padx=(0, 12))
+
+        ttk.Label(bar, text="Schrift:").pack(side="left")
+        ttk.Button(bar, text="-", width=2, command=lambda: self._change_font_adjust(-1)).pack(side="left")
+        ttk.Button(bar, text="+", width=2, command=lambda: self._change_font_adjust(1)).pack(side="left", padx=(0, 12))
 
         ttk.Label(bar, text="Schrift:").pack(side="left")
         ttk.Button(bar, text="-", width=2, command=lambda: self._change_font_adjust(-1)).pack(side="left")
@@ -464,17 +469,17 @@ class PfadAnalyseApp(tk.Frame):
             pass
 
     def _fullwidth_redraw(self):
-        """Canvas an neue Größe anpassen und linken Rand optimal setzen."""
-        try:
-            widget = self.canvas.get_tk_widget()
-            widget.update_idletasks()
-            w = max(1, widget.winfo_width())
-            h = max(1, widget.winfo_height())
-            self.figure.set_size_inches(w / self.figure.dpi, h / self.figure.dpi)
-            self._set_compact_left_margin()
-            self.figure.canvas.draw_idle()
-        except Exception:
-            pass
+      """Canvas an neue Größe anpassen und linken Rand optimal setzen."""
+      try:
+        widget = self.canvas.get_tk_widget()
+        widget.update_idletasks()
+        w = max(1, widget.winfo_width())
+        h = max(1, widget.winfo_height())
+        self.figure.set_size_inches(w / self.figure.dpi, h / self.figure.dpi)
+        self._set_compact_left_margin()
+        self.figure.canvas.draw_idle()
+      except Exception:
+        pass
 
     # ---------- Animation & Styling ----------
     def _animate_bars(self, labels, counts, sizes, node: Node):
@@ -531,10 +536,15 @@ class PfadAnalyseApp(tk.Frame):
         auto_x = max(6, 12 - 0.06 * len(labels))
         auto_y = max(4, 12 - 0.08 * len(labels) + self.font_adjust.get())
 
+        auto_x = max(6, 12 - 0.06 * len(labels))
+        auto_y = max(4, 12 - 0.08 * len(labels) + self.font_adjust.get())
+
         for ax in (self.ax_count, self.ax_size):
-            ax.grid(axis="x", linestyle=":", linewidth=0.6, alpha=0.5)
-            ax.tick_params(axis="x", labelsize=auto_x)
-            ax.tick_params(axis="y", labelsize=auto_y)
+          ax.grid(axis="x", linestyle=":", linewidth=0.6, alpha=0.5)
+          ax.tick_params(axis="x", labelsize=auto_x, bottom=True, labelbottom=True)
+          ax.tick_params(axis="y", labelsize=auto_y)
+          for spine in ("top", "right", "bottom", "left"):
+            ax.spines[spine].set_visible(True)
 
         self.ax_count.xaxis.set_major_formatter(
             ticker.FuncFormatter(lambda x, _: f"{int(round(x)):,}".replace(",", "."))
@@ -647,44 +657,54 @@ class PfadAnalyseApp(tk.Frame):
 
     # ---------- Hilfen ----------
     def _set_top_n(self):
-        win = tk.Toplevel(self)
-        win.title("Top-N einstellen")
-        ttk.Label(win, text="Anzahl (N):").pack(padx=12, pady=(12, 6))
-        sp = tk.Spinbox(win, from_=3, to=100, textvariable=self.top_n, width=6)
-        sp.pack(padx=12, pady=(0, 12))
-        ttk.Button(win, text="OK", command=lambda: (win.destroy(), self.on_tree_select())).pack(pady=(0,12))
+      win = tk.Toplevel(self)
+      win.title("Top-N einstellen")
+      ttk.Label(win, text="Anzahl (N):").pack(padx=12, pady=(12, 6))
+      sp = tk.Spinbox(win, from_=3, to=100, textvariable=self.top_n, width=6)
+      sp.pack(padx=12, pady=(0, 12))
+      ttk.Button(win, text="OK", command=lambda: (win.destroy(), self.on_tree_select())).pack(pady=(0, 12))
 
     def _change_font_adjust(self, delta: int):
-        self.font_adjust.set(self.font_adjust.get() + delta)
-        self.on_tree_select()
+      self.font_adjust.set(self.font_adjust.get() + delta)
+      self.on_tree_select()
 
     def _toggle_tree(self):
-        # Baum ein-/ausblenden
-        if self._tree_visible:
-            # aktuelle Sash-Pos merken und linken Pane entfernen
-            try:
-                self._last_sash = self.body.sashpos(0)
-            except Exception:
-                pass
-            self.body.forget(self.left)  # reicht aus
-            self.btn_toggle_tree.configure(text="Baum einblenden")
-            self._tree_visible = False
-        else:
-            # linken Pane wieder hinzufügen und Sash-Pos wiederherstellen
-            try:
-                self.body.insert(0, self.left)
-            except Exception:
-                self.body.add(self.left, weight=1)
-            self.after(10, lambda: self.body.sashpos(0, self._last_sash))
-            self.btn_toggle_tree.configure(text="Baum ausblenden")
-            self._tree_visible = True
-        # Layout neu berechnen und Diagramme anpassen
-        def resize_and_redraw():
-            try:
-                self.body.update_idletasks()
-                self.canvas.get_tk_widget().update_idletasks()
-            except Exception:
-                pass
-            self._fullwidth_redraw()
+      # Baum ein-/ausblenden
+      if self._tree_visible:
+        # aktuelle Sash-Pos merken und linken Pane entfernen
+        try:
+          self._last_sash = self.body.sashpos(0)
+        except Exception:
+          pass
+        self.body.forget(self.left)
+        try:
+          self.body.paneconfigure(self.right, weight=1, width=self.body.winfo_width())
+        except Exception:
+          pass
+        self.btn_toggle_tree.configure(text="Baum einblenden")
+        self._tree_visible = False
+      else:
+        # linken Pane wieder hinzufügen und Sash-Pos wiederherstellen
+        try:
+          self.body.insert(0, self.left)
+        except Exception:
+          self.body.add(self.left, weight=1)
+        try:
+          self.body.paneconfigure(self.right, weight=2)
+          self.body.paneconfigure(self.left, weight=1)
+        except Exception:
+          pass
+        self.after(10, lambda: self.body.sashpos(0, self._last_sash))
+        self.btn_toggle_tree.configure(text="Baum ausblenden")
+        self._tree_visible = True
 
-        self.after(50, resize_and_redraw)
+      # Layout neu berechnen und Diagramme anpassen
+      def resize_and_redraw():
+        try:
+          self.body.update_idletasks()
+          self.canvas.get_tk_widget().update_idletasks()
+        except Exception:
+          pass
+        self._fullwidth_redraw()
+
+      self.after(100, resize_and_redraw)
