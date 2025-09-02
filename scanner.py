@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Schneller rekursiver Scanner für Windows und macOS.
+Schneller rekursiver Scanner für Windows.
 - Versteckte/System-Ordner werden übersprungen
 - Symlinks/Junctions werden nicht verfolgt (follow_symlinks=False)
 - Optional: mehrere Worker (Standard 1 – oft schneller/konstanter auf HDDs)
@@ -62,32 +62,28 @@ def scan_tree(root_path: str,
 
     stack: List[Tuple[Node, str, bool]] = [(root, root_path, False)]
 
-    executor: Optional[ThreadPoolExecutor] = None
-    if workers > 1:
-        executor = ThreadPoolExecutor(max_workers=workers)
+    while stack:
+        if stop_event is not None and stop_event.is_set():
+            break
+        node, path, expanded = stack.pop()
+        if not expanded:
+            files, dcount, size_sum, children = _scan_single_dir(path, stop_event=stop_event)
+            node.immediate_files = files
+            node.immediate_dirs = dcount
+            node.immediate_size = size_sum
 
-    try:
-        while stack:
-            if stop_event is not None and stop_event.is_set():
-                break
-            node, path, expanded = stack.pop()
-            if not expanded:
-                files, dcount, size_sum, children = _scan_single_dir(path, stop_event=stop_event)
-                node.immediate_files = files
-                node.immediate_dirs = dcount
-                node.immediate_size = size_sum
+            child_nodes = []
+            for cpath in children:
+                cname = os.path.basename(cpath)
+                cn = Node(path=cpath, name=cname)
+                node.children[cname] = cn
+                child_nodes.append((cn, cpath, False))
 
-                child_nodes = []
-                for cpath in children:
-                    cname = os.path.basename(cpath)
-                    cn = Node(path=cpath, name=cname)
-                    node.children[cname] = cn
-                    child_nodes.append((cn, cpath, False))
+            stack.append((node, path, True))
 
-                stack.append((node, path, True))
-
-                if executor and len(child_nodes) > 0 and not (stop_event and stop_event.is_set()):
-                    futs = {executor.submit(_scan_single_dir, cp, stop_event): (cn, cp) for (cn, cp, _) in child_nodes}
+            if len(child_nodes) > 0 and workers > 1 and not (stop_event and stop_event.is_set()):
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = {ex.submit(_scan_single_dir, cp, stop_event): (cn, cp) for (cn, cp, _) in child_nodes}
                     for fut in as_completed(futs):
                         if stop_event is not None and stop_event.is_set():
                             break
@@ -105,25 +101,22 @@ def scan_tree(root_path: str,
                             sn = Node(path=sub, name=sname)
                             cn.children[sname] = sn
                         stack.append((cn, cp, False))
-                else:
-                    stack.extend(child_nodes)
-
-                if progress_cb:
-                    progress_cb(path, files, dcount, size_sum)
             else:
-                # Aggregation
-                tf = node.immediate_files
-                td = node.immediate_dirs
-                ts = node.immediate_size
-                for c in node.children.values():
-                    tf += c.total_files
-                    td += (1 + c.total_dirs)
-                    ts += c.total_size
-                node.total_files = tf
-                node.total_dirs  = td
-                node.total_size  = ts
-    finally:
-        if executor:
-            executor.shutdown(wait=False)
+                stack.extend(child_nodes)
+
+            if progress_cb:
+                progress_cb(path, files, dcount, size_sum)
+        else:
+            # Aggregation
+            tf = node.immediate_files
+            td = node.immediate_dirs
+            ts = node.immediate_size
+            for c in node.children.values():
+                tf += c.total_files
+                td += (1 + c.total_dirs)
+                ts += c.total_size
+            node.total_files = tf
+            node.total_dirs  = td
+            node.total_size  = ts
 
     return root

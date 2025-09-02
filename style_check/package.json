@@ -1,0 +1,22 @@
+{
+  "name": "style_check",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "Lokales Linting-Toolkit (gekapselt) für das Projekt.",
+  "scripts": {
+    "lint:css": "stylelint \"../**/*.css\" \"../**/*.scss\" \"../**/*.sass\" --config stylelint.config.cjs",
+    "lint:html": "htmlhint \"../**/*.html\" -c .htmlhintrc",
+    "lint:js": "eslint \"../\" --config eslint.config.cjs",
+    "lint": "npm run lint:css && npm run lint:html && npm run lint:js",
+    "fix:css": "stylelint \"../**/*.css\" \"../**/*.scss\" \"../**/*.sass\" --config stylelint.config.cjs --fix",
+    "fix:js": "eslint \"../\" --config eslint.config.cjs --fix"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.33.0",
+    "eslint": "^9.33.0",
+    "htmlhint": "^1.2.3",
+    "stylelint": "^16.23.1",
+    "stylelint-config-standard": "^39.0.0"
+  }
+}

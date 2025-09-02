@@ -1,4 +1,4 @@
-# Pfadanalyse v2 (Windows/macOS, Tkinter + Matplotlib)
+# Pfadanalyse v2 (Windows, Tkinter + Matplotlib)
 
 ## Funktionen
 - Schneller Vorscan (voll rekursiv) mit Größen (Bytes), Datei-/Ordneranzahl je Verzeichnis.
@@ -14,5 +14,3 @@
 ## Start
 ```bash
 python app.py
-```
-
