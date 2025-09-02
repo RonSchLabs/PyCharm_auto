@@ -4,7 +4,7 @@ import time
 import threading
 import platform
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -231,7 +231,7 @@ class PfadAnalyseApp(tk.Frame):
         foot.pack(fill="x", padx=8, pady=(0, 8))
         self.status = tk.Label(foot, text="Bereit", anchor="w")
         self.status.pack(side="left", fill="x", expand=True)
-        self.footer_label = tk.Label(foot, text=COPYRIGHT_TEXT, anchor="e", font=("Arial", 8))
+        self.footer_label = tk.Label(foot, text=COPYRIGHT_TEXT, anchor=("e"), font=("Arial", 8))
         self.footer_label.pack(side="right")
 
     # ---------- Commands ----------
@@ -308,4 +308,189 @@ class PfadAnalyseApp(tk.Frame):
         self._scan_start_ts = time.time()
         self.status.config(text=f"Scanne… ({path})")
         self.progress.start(12)
-        self.btn
+        self.btn_scan.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.btn_toggle_tree.configure(state="disabled")
+
+        workers = int(self.worker_var.get())
+        result_holder = {"node": None, "err": None}
+
+        def task():
+            try:
+                def pg(pth, f, d, s):
+                    pass
+                result_holder["node"] = scan_tree(path, workers=workers, progress_cb=pg, stop_event=self._stop_event)
+            except Exception as e:
+                result_holder["err"] = e
+
+        self._scan_thread = threading.Thread(target=task, daemon=True)
+        self._scan_thread.start()
+
+        def check():
+            if result_holder["node"] is not None or result_holder["err"] is not None:
+                self.progress.stop()
+                self.scanning = False
+                self.btn_scan.configure(state="normal")
+                self.btn_stop.configure(state="disabled")
+                self.btn_toggle_tree.configure(state="normal")
+
+                if result_holder["err"]:
+                    self.status.config(text=f"Fehler beim Scannen: {result_holder['err']}")
+                    return
+
+                self.root_node = result_holder["node"]
+                self._populate_tree()
+                if self._stop_event.is_set():
+                    self.status.config(text=f"Scan abgebrochen. (partielles Ergebnis) – {self._current_path.get()}")
+                else:
+                    self.status.config(text=f"Scan abgeschlossen: {self._current_path.get()}")
+            else:
+                self.after(150, check)
+
+        check()
+
+    # ---------- Tree & Charts ----------
+    def _populate_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        if not self.root_node:
+            return
+
+        def insert_node(parent_iid, node: Node):
+            iid = self.tree.insert(
+                parent_iid,
+                "end",
+                text=node.name,
+                values=(
+                    format_int_de(node.total_files),
+                    format_int_de(node.total_dirs),
+                    self._fmt_size(node.total_size),
+                ),
+            )
+            for child in node.child_list():
+                insert_node(iid, child)
+            return iid
+
+        root_iid = insert_node("", self.root_node)
+        self.tree.selection_set(root_iid)
+        self.tree.focus(root_iid)
+        self.tree.see(root_iid)
+        self._autosize_tree_last_col()
+        self.on_tree_select()
+
+    def on_tree_select(self, event=None):
+        node = self._get_selected_node()
+        if not node:
+            return
+
+        labels = [c.name for c in node.child_list()]
+        sizes = [c.total_size for c in node.child_list()]
+        counts = [c.total_files + c.total_dirs for c in node.child_list()]
+
+        # einheitliche Sortierung
+        if self.sort_mode.get() == "count":
+            data = list(zip(labels, counts, sizes))
+            data.sort(key=lambda x: x[1], reverse=True)
+            labels, counts, sizes = zip(*data) if data else ([], [], [])
+        else:
+            data = list(zip(labels, sizes, counts))
+            data.sort(key=lambda x: x[1], reverse=True)
+            labels, sizes, counts = zip(*data) if data else ([], [], [])
+
+        if self.top_n_enabled.get() and labels:
+            n = max(1, int(self.top_n.get()))
+            labels, sizes, counts = list(labels[:n]), list(sizes[:n]), list(counts[:n])
+
+        self._animate_bars(labels, counts, sizes, node)
+
+    def _get_selected_node(self) -> Node | None:
+        if not self.root_node:
+            return None
+        sel = self.tree.selection()
+        if not sel:
+            return self.root_node
+
+        path_names = []
+        iid = sel[0]
+        while iid:
+            path_names.append(self.tree.item(iid, "text"))
+            iid = self.tree.parent(iid)
+        path_names = list(reversed(path_names))
+
+        node = self.root_node
+        for name in path_names[1:]:
+            node = node.children.get(name)
+            if node is None:
+                return self.root_node
+        return node
+
+    def _fmt_size(self, total_bytes: int) -> str:
+        TB = 1024**4
+        GB = 1024**3
+        MB = 1024**2
+        if total_bytes >= TB:
+            return f"{(total_bytes/TB):,.1f} TB".replace(",", ".")
+        if total_bytes >= GB:
+            return f"{(total_bytes/GB):,.1f} GB".replace(",", ".")
+        return f"{(total_bytes/MB):,.1f} MB".replace(",", ".")
+
+    def _fullwidth_redraw(self):
+        self.ax_count.clear()
+        self.ax_size.clear()
+        self.ax_count.set_title("Anzahl Dateien + Ordner je Unterordner")
+        self.ax_size.set_title("Gesamtgröße je Unterordner")
+
+        node = self._get_selected_node()
+        if not node:
+            self.canvas.draw_idle()
+            return
+
+        labels = [c.name for c in node.child_list()]
+        sizes = [c.total_size for c in node.child_list()]
+        counts = [c.total_files + c.total_dirs for c in node.child_list()]
+
+        # gleiche Sortierung wie in on_tree_select
+        if self.sort_mode.get() == "count":
+            data = list(zip(labels, counts, sizes))
+            data.sort(key=lambda x: x[1], reverse=True)
+            labels, counts, sizes = zip(*data) if data else ([], [], [])
+        else:
+            data = list(zip(labels, sizes, counts))
+            data.sort(key=lambda x: x[1], reverse=True)
+            labels, sizes, counts = zip(*data) if data else ([], [], [])
+
+        self.ax_count.barh(labels, counts)
+        self.ax_size.barh(labels, sizes)
+
+        self.ax_count.xaxis.set_major_locator(ticker.MaxNLocator(6))
+        self.ax_size.xaxis.set_major_locator(ticker.MaxNLocator(6))
+        self.ax_size.set_xlabel("Bytes (gesamt)")
+
+        self.figure.tight_layout()
+        self.canvas.draw_idle()
+
+    def _animate_bars(self, labels, counts, sizes, node: Node):
+        # einfache Animation: wir zeichnen einmal voll (keine aufwändige Frames)
+        self._fullwidth_redraw()
+
+    def _set_top_n(self):
+        try:
+            n = int(simpledialog.askstring("Top-N", "Wie viele Einträge anzeigen?", initialvalue=str(self.top_n.get())) or "0")
+            if n > 0:
+                self.top_n.set(n)
+                self.on_tree_select()
+        except Exception:
+            pass
+
+    def _on_close(self):
+        try:
+            self.cmd_stop_scan()
+        except Exception:
+            pass
+        try:
+            self.master.quit()
+        except Exception:
+            pass
+        try:
+            self.master.destroy()
+        except Exception:
+            pass
