@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Dict, Any, List
 import json
+
 
 @dataclass
 class Node:
@@ -56,14 +58,7 @@ class Node:
     def from_json(s: str) -> "Node":
         return Node.from_dict(json.loads(s))
 
+
 def format_int_de(n: int) -> str:
     s = f"{int(n):,}"
     return s.replace(",", ".")
-
-def format_bytes_mb_gb(total_bytes: int) -> (float, str):
-    GB = 1024 ** 3
-    MB = 1024 ** 2
-    if total_bytes >= GB:
-        return total_bytes / GB, "GB"
-    else:
-        return total_bytes / MB, "MB"
